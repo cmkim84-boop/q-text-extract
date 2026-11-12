@@ -1,0 +1,36 @@
+name: Build Windows installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt pyinstaller pytest
+      - name: Unit tests
+        run: python -m pytest -q tests
+      - name: Make icon
+        run: python make_icon.py
+      - run: python -m PyInstaller --noconfirm --windowed --onedir --icon assets\icon.ico --add-data "assets;assets" --collect-all winrt --name QTextExtract app.py
+      - name: Check OCR parts inside the built app
+        # 묶인 프로그램 안에서 윈도우 OCR 부품이 실제로 도는지 확인한다. 결과는 로그에 찍힌다.
+        shell: pwsh
+        run: |
+          Start-Process -FilePath "dist\QTextExtract\QTextExtract.exe" -ArgumentList "--selftest","selftest.txt" -Wait -NoNewWindow
+          if (Test-Path selftest.txt) { Get-Content selftest.txt } else { Write-Host "selftest.txt 가 만들어지지 않았어요"; exit 1 }
+          if (Select-String -Path selftest.txt -Pattern "RESULT: FAIL" -Quiet) { exit 1 }
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+      - name: Build installer
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: QTextExtract-Setup
+          path: installer_output/QTextExtract-Setup.exe
