@@ -223,7 +223,7 @@ def _recognize_dev(img: Image.Image, lang: str) -> tuple[list[OcrLine], str]:
 
 # ---------------------------------------------------------------- 점검용 (빌드 직후 자동 확인)
 def selftest(path: str) -> int:
-    """`QTextExtract.exe --selftest 결과파일` — 묶인 프로그램에서 글자 인식 부품이 실제로 도는지 확인한다."""
+    """`QTextExtract.exe --selftest 결과파일` — 묶인 프로그램에서 글자 인식·문서(PDF·HWPX) 읽기 부품이 실제로 도는지 확인한다."""
     log: list[str] = []
     ok = True
     try:
@@ -254,6 +254,24 @@ def selftest(path: str) -> int:
     except Exception as ex:  # noqa: BLE001
         ok = False
         log.append(f"FAIL: {type(ex).__name__}: {ex}")
+    try:  # 문서(PDF·HWPX) 읽기 부품도 묶인 프로그램 안에서 도는지 확인
+        import docextract
+
+        d_ok, d_log = docextract.selftest_docs()
+        log.extend(d_log)
+        ok = ok and d_ok
+    except Exception as ex:  # noqa: BLE001
+        ok = False
+        log.append(f"FAIL: docs: {type(ex).__name__}: {ex}")
+    try:  # AI 기사 초안용 지침 파일(prompts)이 묶인 프로그램 안에 들어 있는지 확인
+        import aidraft
+
+        p_ok, p_log = aidraft.selftest_prompts()
+        log.extend(p_log)
+        ok = ok and p_ok
+    except Exception as ex:  # noqa: BLE001
+        ok = False
+        log.append(f"FAIL: prompts: {type(ex).__name__}: {ex}")
     log.append("RESULT: PASS" if ok else "RESULT: FAIL")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(log) + "\n")

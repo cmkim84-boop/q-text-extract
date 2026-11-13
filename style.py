@@ -89,6 +89,13 @@ QPushButton#chip { background: #26282f; border: 1px solid #2a2c33; border-radius
 QPushButton#chip:hover { border-color: #444853; color: #e8e9ed; }
 QPushButton#chip:checked { background: rgba(31,201,142,38); border: 1px solid #1fc98e; color: #7ee3bd; font-weight: normal; }
 QPushButton#chip:disabled { color: #5d6170; }
+QPushButton#seg { background: transparent; border: 1px solid #2a2c33; border-radius: 8px; padding: 5px 11px; color: #9096a3; font-size: 12px; }
+QPushButton#seg:hover { border-color: #444853; color: #e8e9ed; }
+QPushButton#seg:checked { background: rgba(31,201,142,38); border: 1px solid #1fc98e; color: #7ee3bd; font-weight: bold; }
+QLineEdit { background: #26282f; border: 1px solid #343740; border-radius: 8px; padding: 6px 8px; min-height: 20px;
+  selection-background-color: #1fc98e; selection-color: #0b1f17; }
+QLineEdit:focus { border-color: #1fc98e; }
+QCheckBox, QRadioButton { spacing: 8px; }
 QPlainTextEdit { background: #15161a; border: 1px solid #2a2c33; border-radius: 8px; padding: 6px 8px;
   selection-background-color: #1fc98e; }
 QPlainTextEdit:focus { border-color: #1fc98e; }

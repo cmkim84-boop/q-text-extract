@@ -6,8 +6,8 @@ import statistics
 from typing import Sequence
 
 # 새 문단이 시작되는 줄의 머리 기호: □ ○ ㅇ ※ * - • ▶ 와  1. / 1) / 가.
-_BULLET = re.compile(r"^\s*(?:[□■▢○●◦◎ㅇㅁ※*•▶▷◆◇\-–—]\s|\d{1,2}[.)]\s|[가-하][.)]\s|[(（]\d{1,2}[)）]\s)")
-_SPACE_RUN = re.compile(r"[ \t 　]+")
+_BULLET = re.compile(r"^\s*(?:[□■▢○●◦◎ㅁ※*•▶▷◆◇\-–—∙·ㆍ]\s|ㅇ(?=[\s가-힣\[(<])|[□■▢○●◦◎ㅁ※▶▷◆◇](?=[가-힣\[(<])|\d{1,2}[.)]\s|[가-하][.)]\s|[(（]\d{1,2}[)）]\s)")
+_SPACE_RUN = re.compile(r"[ \u00a0\u3000]+")  # 탭(표 칸 구분)은 그대로 둔다
 
 # 숫자 점검용: 숫자 + 단위 (콤마·소수점 포함). 기사에서 틀리면 곤란한 값들을 눈에 띄게 한다.
 NUMBER_PATTERN = re.compile(
@@ -15,8 +15,21 @@ NUMBER_PATTERN = re.compile(
 )
 
 
+_NUM_TOKEN = re.compile(r"[‘'’]?-?[\d.,]+[%년주]?")
+
+
+def is_table_like(text: str) -> bool:
+    """숫자 칸이 많은 줄(표·차트 눈금)이거나 탭으로 칸이 나뉜 줄. 문장이 아니므로 앞뒤 줄과 잇지 않는다."""
+    if "\t" in text:
+        return True
+    toks = text.split()
+    return len(toks) >= 4 and sum(bool(_NUM_TOKEN.fullmatch(t)) for t in toks) / len(toks) >= 0.4
+
+
 def _is_new_paragraph(prev, cur, med_h: float, max_w: float) -> bool:
     if _BULLET.match(cur.text):
+        return True
+    if is_table_like(prev.text) or is_table_like(cur.text):
         return True
     gap = cur.y - (prev.y + prev.h)
     if med_h > 0 and gap > 0.9 * med_h:  # 줄 사이가 유난히 벌어짐

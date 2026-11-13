@@ -1,5 +1,7 @@
 PySide6>=6.6
 Pillow>=10.0
+pdfplumber>=0.11
+olefile>=0.46
 winrt-runtime>=2.0; sys_platform == "win32"
 winrt-Windows.Foundation>=2.0; sys_platform == "win32"
 winrt-Windows.Foundation.Collections>=2.0; sys_platform == "win32"

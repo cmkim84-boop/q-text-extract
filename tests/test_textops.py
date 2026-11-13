@@ -49,3 +49,17 @@ def test_number_spans():
     t = "영업이익 1조2000억원, 전년比 18% 증가, 361조원"
     found = [t[a:b].strip() for a, b in number_spans(t)]
     assert "1조" in found and "2000억" in found and "18%" in found and "361조" in found
+
+
+def test_table_rows_are_not_joined():
+    lines = [L("수원 2.05 13.01 0.42 0.47 0.40 0.45", 0, w=500), L("수원 장안 1.46 8.62 0.28 0.36 0.34 0.33", 22, w=500)]
+    assert build_text(lines).split("\n") == ["수원 2.05 13.01 0.42 0.47 0.40 0.45", "수원 장안 1.46 8.62 0.28 0.36 0.34 0.33"]
+
+
+def test_tab_between_table_cells_is_kept():
+    assert tidy_spaces("부장\t김민섭   ☎(053)663-8501") == "부장\t김민섭 ☎(053)663-8501"
+
+
+def test_bullet_without_space_after_marker():
+    lines = [L("앞 문단이 가득 찬 줄입니다 가득 찬 줄입니다", 0), L("ㅇ시도별로는 경기(0.21%)", 22)]
+    assert build_text(lines).split("\n")[1].startswith("ㅇ시도별로는")

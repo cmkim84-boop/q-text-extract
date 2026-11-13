@@ -2,7 +2,7 @@
 ; 빌드: ISCC.exe installer.iss  ->  installer_output\QTextExtract-Setup.exe
 #define MyAppName "Q 텍스트 추출"
 #define MyAppExeName "QTextExtract.exe"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.2.0"
 
 [Setup]
 AppId={{7B1E5C3A-4D2F-4F6E-9A58-3C0D6E8B21F4}}

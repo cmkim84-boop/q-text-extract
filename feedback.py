@@ -28,10 +28,10 @@ from PySide6.QtWidgets import (
 
 # 구글 앱스 스크립트 '웹 앱' 주소. 예) "https://script.google.com/macros/s/AKfy.../exec"
 FEEDBACK_URL = "https://script.google.com/macros/s/AKfycbw8rEsLlYWcQ4gsJqUHT8XanHCxAspgXsIGqCDWjog0zoE6hYngnncX--iyRLgFS05Y/exec"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.2.0"
 
 APP_ID = "Q 텍스트 추출"  # 같은 의견 시트를 여러 Q 프로그램이 함께 쓸 때 구분하는 이름
-FEATURES = ["이미지 열기", "붙여넣기", "영역 선택", "줄바꿈 정리", "복사"]
+FEATURES = ["PDF·HWPX 열기", "이미지 열기", "붙여넣기", "영역 선택", "줄바꿈 정리", "복사", "AI 기사 초안"]
 MAX_COMMENT = 300
 SKIP_LIMIT = 3
 SEND_TIMEOUT = 10  # 초

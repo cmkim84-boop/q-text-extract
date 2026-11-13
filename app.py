@@ -1,9 +1,10 @@
-"""Q 텍스트 추출 - 이미지 속 글자를 읽어 복사할 수 있는 글로 바꿔 주는 윈도우 데스크톱 앱."""
+"""Q 텍스트 추출 - 보도자료 문서(PDF·HWPX·HWP)의 글을 그대로 꺼내고, 이미지는 글자 인식(OCR)으로 읽어 복사할 수 있는 글로 만드는 윈도우 데스크톱 앱."""
 from __future__ import annotations
 
 import io
 import os
 import sys
+import time
 
 from PIL import Image, ImageOps
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPointF, QRect, QRectF, QSettings, QSize, Qt, QThread, QTimer, Signal
@@ -14,8 +15,10 @@ from PySide6.QtGui import (
     QImage,
     QKeySequence,
     QPainter,
+    QPainterPath,
     QPen,
     QPixmap,
+    QPolygonF,
     QShortcut,
     QTextCharFormat,
     QTextCursor,
@@ -23,6 +26,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -37,14 +41,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import aidraft
+import aiui
+import docextract
 import ocr_engine
 import textops
 from feedback import APP_VERSION, ask_on_exit
-from style import C_ACCENT, C_MUTED, C_WARN, apply_theme
+from style import C_ACCENT, C_MUTED, C_ON_ACCENT, C_WARN, apply_theme
 
 APP_NAME = "Q 텍스트 추출"
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif")
+DOC_EXTS = docextract.DOC_EXTS  # .pdf .hwpx .hwp
 MIN_REGION_PX = 8  # 영역으로 인정하는 최소 드래그 크기(화면 px)
+OCR_NOTICE = ("이미지에서 글자를 읽은 결과예요. 숫자·고유명사가 틀릴 수 있으니 원본과 꼭 대조해 주세요. "
+              "보도자료 원본(PDF·HWPX)이 있으면 그 파일을 열면 틀리지 않아요.")
 
 
 def resource_path(*parts: str) -> str:
@@ -135,6 +145,24 @@ class OcrWorker(QThread):
             self.failed.emit(self.job, f"글자를 읽는 중 문제가 생겼어요. ({type(ex).__name__}: {ex})")
 
 
+# ---------------------------------------------------------------- 문서 읽기 작업 스레드
+class DocWorker(QThread):
+    ok = Signal(int, object)
+    failed = Signal(int, str)
+
+    def __init__(self, job: int, path: str, parent=None) -> None:
+        super().__init__(parent)
+        self.job, self.path = job, path
+
+    def run(self) -> None:
+        try:
+            self.ok.emit(self.job, docextract.extract_document(self.path))
+        except docextract.DocError as ex:
+            self.failed.emit(self.job, str(ex))
+        except Exception as ex:  # noqa: BLE001
+            self.failed.emit(self.job, f"문서를 읽는 중 문제가 생겼어요. ({type(ex).__name__}: {ex})")
+
+
 # ---------------------------------------------------------------- 이미지 보기 + 영역 선택
 class ImageView(QWidget):
     region_changed = Signal(object)  # (x, y, w, h) 이미지 좌표, 지우면 None
@@ -150,13 +178,23 @@ class ImageView(QWidget):
         self._drag_a: QPointF | None = None
         self._drag_b: QPointF | None = None
         self._busy = False
+        self._doc: tuple[str, str, str] | None = None  # (파일 이름, 종류 표시, 안내 문구) 문서를 열었을 때의 카드
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
         self.setMinimumSize(340, 320)
         self.setFocusPolicy(Qt.StrongFocus)
 
     # --- 상태
+    def set_document(self, name: str, kind: str, info: str) -> None:
+        """문서(PDF·HWPX·HWP)를 열었을 때: 이미지 대신 파일 카드를 보여준다."""
+        self._pm = None
+        self._doc = (name, kind, info)
+        self._lines, self._region, self._drag_a, self._drag_b = [], None, None, None
+        self.setCursor(Qt.ArrowCursor)
+        self.update()
+
     def set_image(self, img: Image.Image) -> None:
+        self._doc = None
         self._pm = pil_to_qpixmap(img)
         self._size = img.size
         self._lines, self._region, self._drag_a, self._drag_b = [], None, None, None
@@ -206,6 +244,9 @@ class ImageView(QWidget):
         p.setPen(Qt.NoPen)
         p.setBrush(QColor("#1d1e23"))
         p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 14, 14)
+        if self._doc:
+            self._paint_doc(p)
+            return
         if not self._pm:
             self._paint_empty(p)
             return
@@ -248,6 +289,55 @@ class ImageView(QWidget):
             p.setFont(QFont("Malgun Gothic", 11))
             p.drawText(f, Qt.AlignCenter, "글자를 읽는 중…")
 
+    def _paint_doc(self, p: QPainter) -> None:
+        name, kind, info = self._doc
+        r = QRectF(self.rect()).adjusted(22, 22, -22, -22)
+        c = r.center()
+        # 문서 모양 카드 (한 귀퉁이가 접힌 종이)
+        w, h = 150.0, 190.0
+        page = QRectF(c.x() - w / 2, c.y() - h / 2 - 40, w, h)
+        fold = 34.0
+        path = QPainterPath()
+        path.moveTo(page.left(), page.top())
+        path.lineTo(page.right() - fold, page.top())
+        path.lineTo(page.right(), page.top() + fold)
+        path.lineTo(page.right(), page.bottom())
+        path.lineTo(page.left(), page.bottom())
+        path.closeSubpath()
+        p.setPen(QPen(QColor("#3a3d47"), 1.5))
+        p.setBrush(QColor("#26282f"))
+        p.drawPath(path)
+        tri = QPolygonF([QPointF(page.right() - fold, page.top()), QPointF(page.right() - fold, page.top() + fold),
+                         QPointF(page.right(), page.top() + fold)])
+        p.setBrush(QColor("#343740"))
+        p.drawPolygon(tri)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(C_ACCENT))
+        badge = QRectF(page.left() + 16, page.top() + 70, 74, 28)
+        p.drawRoundedRect(badge, 6, 6)
+        p.setPen(QColor(C_ON_ACCENT))
+        p.setFont(QFont("Malgun Gothic", 11, QFont.Bold))
+        p.drawText(badge, Qt.AlignCenter, kind)
+        p.setBrush(QColor("#3a3d47"))
+        p.setPen(Qt.NoPen)
+        for i, ww in enumerate((118, 96, 108, 70)):
+            p.drawRoundedRect(QRectF(page.left() + 16, page.top() + 116 + i * 16, ww, 6), 3, 3)
+        p.setPen(QColor("#e8e9ed"))
+        p.setFont(QFont("Malgun Gothic", 12, QFont.Bold))
+        fm = p.fontMetrics()
+        shown = fm.elidedText(name, Qt.ElideMiddle, int(r.width() - 40))
+        p.drawText(QRectF(r.left(), page.bottom() + 22, r.width(), 26), Qt.AlignCenter, shown)
+        p.setPen(QColor(C_MUTED))
+        p.setFont(QFont("Malgun Gothic", 10))
+        p.drawText(QRectF(r.left() + 10, page.bottom() + 52, r.width() - 20, 44), Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap, info)
+        if self._busy:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(21, 22, 26, 170))
+            p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 14, 14)
+            p.setPen(QColor("#e8e9ed"))
+            p.setFont(QFont("Malgun Gothic", 12))
+            p.drawText(QRectF(self.rect()), Qt.AlignCenter, "문서를 읽는 중…")
+
     def _paint_empty(self, p: QPainter) -> None:
         r = QRectF(self.rect()).adjusted(22, 22, -22, -22)
         p.setPen(QPen(QColor("#3a3d47"), 1.5, Qt.DashLine))
@@ -256,12 +346,12 @@ class ImageView(QWidget):
         c = r.center()
         p.setPen(QColor("#e8e9ed"))
         p.setFont(QFont("Malgun Gothic", 13, QFont.Bold))
-        p.drawText(QRectF(r.left(), c.y() - 44, r.width(), 28), Qt.AlignCenter, "이미지를 여기에 끌어다 놓으세요")
+        p.drawText(QRectF(r.left(), c.y() - 44, r.width(), 28), Qt.AlignCenter, "PDF·HWPX 문서나 이미지를 끌어다 놓으세요")
         p.setPen(QColor(C_MUTED))
         p.setFont(QFont("Malgun Gothic", 10))
-        p.drawText(QRectF(r.left(), c.y() - 12, r.width(), 22), Qt.AlignCenter, "또는 Ctrl+V 로 붙여넣기 · 클릭해서 파일 열기")
+        p.drawText(QRectF(r.left(), c.y() - 12, r.width(), 22), Qt.AlignCenter, "문서는 원본 글을 그대로 가져와요 · 이미지는 Ctrl+V 로 붙여넣기 · 클릭해서 파일 열기")
         p.setPen(QColor("#767b86"))
-        p.drawText(QRectF(r.left(), c.y() + 18, r.width(), 22), Qt.AlignCenter, "화면 캡처는 Win + Shift + S")
+        p.drawText(QRectF(r.left(), c.y() + 18, r.width(), 22), Qt.AlignCenter, "보도자료는 PDF·HWPX 원본이 있으면 이미지보다 정확해요")
 
     # --- 영역 드래그
     def _current_rect(self) -> QRect | None:
@@ -348,6 +438,7 @@ class MainWindow(QMainWindow):
 
         self.img: Image.Image | None = None
         self.img_path = ""
+        self.doc_path = ""  # 문서(PDF·HWPX·HWP)를 열었을 때의 경로
         self.lines: list[ocr_engine.OcrLine] = []
         self.region = None
         self._job = 0
@@ -356,6 +447,10 @@ class MainWindow(QMainWindow):
         self._setting_text = False
         self._used = False  # 한 번이라도 글자를 읽었는지 (종료 때 의견 팝업 조건)
         self._busy = False
+        self._tab = "src"  # 지금 보는 탭: src(추출한 글) / ko / en / chk / title
+        self._texts: dict[str, str] = {}  # 다른 탭으로 옮길 때 각 탭의 글을 보관
+        self._draft = None  # 마지막 AI 초안 결과
+        self._scope_src = ""  # 추출한 글 탭의 머리말(원본 텍스트 · n쪽)
 
         self._build_ui()
         self._load_languages()
@@ -375,16 +470,19 @@ class MainWindow(QMainWindow):
         bl = QHBoxLayout(bar)
         bl.setContentsMargins(14, 10, 14, 10)
         bl.setSpacing(8)
-        self.btn_open = QPushButton("이미지 열기")
+        self.btn_open = QPushButton("파일 열기")
         self.btn_paste = QPushButton("붙여넣기  Ctrl+V")
         self.btn_region = QPushButton("전체 영역으로")
         self.btn_region.setObjectName("ghost")
         self.btn_region.setToolTip("드래그로 지정한 영역을 지우고 이미지 전체를 다시 읽어요. (우클릭 / Esc)")
-        for b in (self.btn_open, self.btn_paste, self.btn_region):
+        self.btn_ai_set = QPushButton("AI 설정")
+        self.btn_ai_set.setObjectName("ghost")
+        self.btn_ai_set.setToolTip("AI 기사 초안에 쓰는 API 키와 모델을 설정해요.")
+        for b in (self.btn_open, self.btn_paste, self.btn_region, self.btn_ai_set):
             b.setCursor(Qt.PointingHandCursor)
             bl.addWidget(b)
         bl.addStretch(1)
-        lb = QLabel("인식 언어")
+        lb = QLabel("이미지 인식 언어")
         lb.setObjectName("muted")
         self.cmb_lang = QComboBox()
         self.cmb_lang.setMinimumWidth(150)
@@ -404,7 +502,7 @@ class MainWindow(QMainWindow):
         ll.setSpacing(8)
         self.view = ImageView()
         ll.addWidget(self.view, 1)
-        self.hint = QLabel("이미지 위에서 드래그하면 그 부분만 다시 읽어요.")
+        self.hint = QLabel("PDF·HWPX·HWP 문서는 원본 글을 그대로 가져오고, 이미지는 글자 인식(OCR)으로 읽어요.")
         self.hint.setObjectName("hint")
         ll.addWidget(self.hint)
         split.addWidget(left)
@@ -425,6 +523,26 @@ class MainWindow(QMainWindow):
         head.addWidget(self.lbl_scope)
         rl.addLayout(head)
 
+        # AI 초안이 만들어지면 나타나는 탭 (처음에는 숨김)
+        self.tab_btns: dict[str, QPushButton] = {}
+        tabrow = QHBoxLayout()
+        tabrow.setSpacing(6)
+        tabrow.setContentsMargins(0, 0, 0, 0)
+        for key, label in ("src", "추출한 글"), ("ko", "국문 초안"), ("en", "영문 초안"), ("chk", "분류·검증"), ("title", "제목 3안"):
+            b = QPushButton(label)
+            b.setObjectName("seg")
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(lambda _c=False, k=key: self._show_tab(k))
+            self.tab_btns[key] = b
+            tabrow.addWidget(b)
+        tabrow.addStretch(1)
+        self.tab_wrap = QWidget()
+        self.tab_wrap.setLayout(tabrow)
+        self.tab_wrap.hide()
+        self.tab_btns["src"].setChecked(True)
+        rl.addWidget(self.tab_wrap)
+
         self.warn = QLabel("")
         self.warn.setObjectName("warn")
         self.warn.setWordWrap(True)
@@ -433,7 +551,7 @@ class MainWindow(QMainWindow):
 
         self.edit = ResultEdit()
         self.edit.setObjectName("result")
-        self.edit.setPlaceholderText("이미지를 열면 읽은 글이 여기에 나와요. 바로 고칠 수도 있어요.")
+        self.edit.setPlaceholderText("문서나 이미지를 열면 글이 여기에 나와요. 바로 고칠 수도 있어요.")
         f = QFont("Malgun Gothic", 10)
         f.setStyleHint(QFont.SansSerif)
         self.edit.setFont(f)
@@ -441,23 +559,32 @@ class MainWindow(QMainWindow):
 
         chips = QHBoxLayout()
         chips.setSpacing(6)
+        chips.setContentsMargins(0, 0, 0, 0)
         self.chip_join = self._chip("줄바꿈 정리", "문단 안의 줄바꿈을 없애고 이어 붙여요.", "join", True)
         self.chip_space = self._chip("공백 정리", "겹친 공백과 괄호·쉼표 주변 공백을 정리해요.", "space", True)
         self.chip_num = self._chip("숫자 강조", "숫자와 단위에 색을 입혀 원본과 대조하기 쉽게 해요.", "num", True)
         for c in (self.chip_join, self.chip_space, self.chip_num):
             chips.addWidget(c)
         chips.addStretch(1)
-        rl.addLayout(chips)
+        self.chip_wrap = QWidget()
+        self.chip_wrap.setLayout(chips)
+        rl.addWidget(self.chip_wrap)
 
         btns = QHBoxLayout()
         btns.setSpacing(8)
         self.btn_copy = QPushButton("전체 복사")
         self.btn_copy.setObjectName("primary")
         self.btn_copy.setCursor(Qt.PointingHandCursor)
+        self.btn_ai = QPushButton("기사 초안 → AI")
+        self.btn_ai.setObjectName("accent")
+        self.btn_ai.setCursor(Qt.PointingHandCursor)
+        self.btn_ai.setStyleSheet("padding: 11px 14px;")
+        self.btn_ai.setToolTip("추출한 글을 AI가 읽고 아주뉴스 지침에 맞춰 기사 초안을 써요.")
         self.btn_save = QPushButton("txt 저장")
         self.btn_save.setCursor(Qt.PointingHandCursor)
         self.btn_save.setStyleSheet("padding: 11px 16px;")
         btns.addWidget(self.btn_copy, 1)
+        btns.addWidget(self.btn_ai)
         btns.addWidget(self.btn_save)
         rl.addLayout(btns)
         split.addWidget(right)
@@ -478,7 +605,7 @@ class MainWindow(QMainWindow):
         sb.addWidget(self.lbl_state, 1)
         sb.addPermanentWidget(self.lbl_count)
         sb.addPermanentWidget(self.lbl_ver)
-        self._set_state("이미지를 열거나 붙여넣어 주세요.")
+        self._set_state("문서(PDF·HWPX)를 열거나 이미지를 붙여넣어 주세요.")
         self._refresh_enabled()
 
     def _chip(self, text: str, tip: str, key: str, default: bool) -> QPushButton:
@@ -512,6 +639,8 @@ class MainWindow(QMainWindow):
         self.btn_region.clicked.connect(self._clear_region)
         self.btn_copy.clicked.connect(self.copy_all)
         self.btn_save.clicked.connect(self.save_txt)
+        self.btn_ai.clicked.connect(self.start_ai)
+        self.btn_ai_set.clicked.connect(self.open_ai_settings)
         self.view.region_changed.connect(self._on_region)
         self.view.files_dropped.connect(self.open_paths)
         self.view.open_requested.connect(self.open_dialog)
@@ -540,6 +669,7 @@ class MainWindow(QMainWindow):
         self.btn_region.setEnabled(has and self.region is not None)
         self.btn_copy.setEnabled(bool(self.edit.toPlainText().strip()))
         self.btn_save.setEnabled(bool(self.edit.toPlainText().strip()))
+        self.btn_ai.setEnabled(bool(self._src_text().strip()) and not self._busy)
         self.btn_paste.setEnabled(not self._busy)
         self.btn_open.setEnabled(not self._busy)
 
@@ -548,25 +678,88 @@ class MainWindow(QMainWindow):
 
     # --- 이미지 넣기
     def open_dialog(self) -> None:
-        exts = " ".join(f"*{e}" for e in IMAGE_EXTS)
-        path, _ = QFileDialog.getOpenFileName(self, "이미지 열기", self.settings.value("last_dir", ""), f"이미지 ({exts})")
+        docs = " ".join(f"*{e}" for e in DOC_EXTS)
+        imgs = " ".join(f"*{e}" for e in IMAGE_EXTS)
+        path, _ = QFileDialog.getOpenFileName(
+            self, "파일 열기", self.settings.value("last_dir", ""),
+            f"문서·이미지 ({docs} {imgs});;문서 ({docs});;이미지 ({imgs})")
         if path:
             self.open_paths([path])
 
     def open_paths(self, paths: list[str]) -> None:
-        paths = [p for p in paths if p.lower().endswith(IMAGE_EXTS)]
+        paths = [p for p in paths if p.lower().endswith(DOC_EXTS + IMAGE_EXTS)]
         if not paths:
-            self._set_state("이미지 파일(jpg, png 등)만 열 수 있어요.", warn=True)
+            self._set_state("PDF, HWPX, HWP 문서나 이미지 파일(jpg, png 등)만 열 수 있어요.", warn=True)
             return
-        try:
-            img = load_image(paths[0])
-        except Exception as ex:  # noqa: BLE001
-            self._set_state(f"이미지를 열 수 없어요. ({ex})", warn=True)
+        if self._busy:
+            self._set_state("지금 읽는 중이에요. 끝난 뒤에 다시 열어 주세요.", warn=True)
             return
-        self.settings.setValue("last_dir", os.path.dirname(paths[0]))
-        self._set_image(img, paths[0])
+        first = paths[0]
+        self.settings.setValue("last_dir", os.path.dirname(first))
+        if first.lower().endswith(DOC_EXTS):
+            self._open_document(first)
+        else:
+            try:
+                img = load_image(first)
+            except Exception as ex:  # noqa: BLE001
+                self._set_state(f"이미지를 열 수 없어요. ({ex})", warn=True)
+                return
+            self._set_image(img, first)
         if len(paths) > 1:
-            self._set_state(f"한 번에 한 장씩 읽어요. 첫 번째 이미지만 열었어요. ({len(paths) - 1}장 제외)", warn=True)
+            self._set_state(f"한 번에 하나씩 읽어요. 첫 번째 파일만 열었어요. ({len(paths) - 1}개 제외)", warn=True)
+
+    # --- 문서(PDF·HWPX·HWP) 넣기: 원본 글을 그대로 꺼낸다
+    def _open_document(self, path: str) -> None:
+        self.img, self.img_path, self.region, self.lines = None, "", None, []
+        self.doc_path = path
+        self._reset_ai()
+        ext = os.path.splitext(path)[1].upper().lstrip(".")
+        self.view.set_document(os.path.basename(path), ext, "원본 파일 안의 글을 그대로 가져와요.")
+        self.hint.setText("문서는 원본 글을 그대로 가져와서 글자가 틀리지 않아요. 다른 파일을 끌어다 놓으면 바꿔서 읽어요.")
+        self._set_text("", dirty=False)
+        self.warn.hide()
+        self.lbl_scope.setText("")
+        self._job += 1
+        job = self._job
+        self._busy = True
+        self.view.set_busy(True)
+        self._set_state("문서를 읽는 중… (쪽이 많으면 몇 초 걸려요)")
+        self._refresh_enabled()
+        self._t_doc = time.perf_counter()
+        w = DocWorker(job, path, self)
+        w.ok.connect(self._on_doc_ok)
+        w.failed.connect(self._on_doc_fail)
+        w.finished.connect(lambda ww=w: self._workers.remove(ww) if ww in self._workers else None)
+        self._workers.append(w)
+        w.start()
+
+    def _on_doc_ok(self, job: int, res) -> None:
+        if job != self._job:
+            return
+        self._finish_busy()
+        self._used = True
+        self.lines = res.lines
+        kind = res.kind.upper()
+        pages = f" · {res.pages}쪽" if res.pages else ""
+        self.view.set_document(os.path.basename(self.doc_path), kind, f"원본 글을 그대로 가져왔어요{pages}")
+        self.lbl_scope.setText(f"원본 텍스트{pages}")
+        self._render_text()
+        if res.notes:
+            self._show_warn(" ".join(res.notes))
+        else:
+            self.warn.hide()
+        sec = time.perf_counter() - getattr(self, "_t_doc", time.perf_counter())
+        if res.lines:
+            self._set_state(f"문서에서 글을 가져왔어요 · {sec:.1f}초 · 원본 그대로예요. 쪽번호는 빼고 줄바꿈을 정리했어요.")
+        else:
+            self._set_state("가져온 글이 없어요.", warn=True)
+
+    def _on_doc_fail(self, job: int, msg: str) -> None:
+        if job != self._job:
+            return
+        self._finish_busy()
+        self._show_warn(msg)
+        self._set_state("문서를 읽지 못했어요.", warn=True)
 
     def paste_image(self) -> None:
         md = QApplication.clipboard().mimeData()
@@ -587,6 +780,8 @@ class MainWindow(QMainWindow):
 
     def _set_image(self, img: Image.Image, path: str) -> None:
         self.img, self.img_path, self.region = img, path, None
+        self.doc_path = ""
+        self._reset_ai()
         self.lines = []
         self.view.set_image(img)
         self.hint.setText("이미지 위에서 드래그하면 그 부분만 다시 읽어요. (우클릭 또는 Esc 로 전체 영역)")
@@ -638,7 +833,7 @@ class MainWindow(QMainWindow):
             return
         self._finish_busy()
         self._used = True
-        self.warn.hide()
+        self._show_warn(OCR_NOTICE)
         self.lines = res.lines
         self.view.set_lines(res.lines)
         self.lbl_scope.setText("선택 영역" if self.region else "이미지 전체")
@@ -674,14 +869,15 @@ class MainWindow(QMainWindow):
     def _on_edit(self) -> None:
         if self._setting_text:
             return
-        self._dirty = True
+        if self._tab == "src":
+            self._dirty = True
         self._apply_highlight()
         self._refresh_enabled()
         self.lbl_count.setText(f"글자 수 {len(self.edit.toPlainText().replace(chr(10), '')):,}자")
 
     def _apply_highlight(self) -> None:
         sels = []
-        if self.chip_num.isChecked():
+        if self.chip_num.isChecked() and self._tab == "src":
             fmt = QTextCharFormat()
             fmt.setBackground(QColor(31, 201, 142, 60))
             fmt.setForeground(QColor("#bff5df"))
@@ -723,6 +919,11 @@ class MainWindow(QMainWindow):
             self._run_ocr()
 
     # --- 복사 / 저장
+    TAB_NAMES = {"src": "", "ko": "_국문초안", "en": "_영문초안", "chk": "_분류검증", "title": "_제목"}
+
+    def _copy_label(self) -> str:
+        return "전체 복사" if self._tab == "src" else "이 탭 복사"
+
     def copy_all(self) -> None:
         text = self.edit.toPlainText()
         if not text.strip():
@@ -730,13 +931,14 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().setText(text)
         self._set_state(f"복사했어요. ({len(text.replace(chr(10), '')):,}자)")
         self.btn_copy.setText("복사했어요")
-        QTimer.singleShot(1500, lambda: self.btn_copy.setText("전체 복사"))
+        QTimer.singleShot(1500, lambda: self.btn_copy.setText(self._copy_label()))
 
     def save_txt(self) -> None:
         text = self.edit.toPlainText()
         if not text.strip():
             return
-        base = os.path.splitext(os.path.basename(self.img_path))[0] if self.img_path else "추출텍스트"
+        src = self.doc_path or self.img_path
+        base = (os.path.splitext(os.path.basename(src))[0] if src else "추출텍스트") + self.TAB_NAMES.get(self._tab, "")
         start = os.path.join(str(self.settings.value("last_dir", "")), base + ".txt")
         path, _ = QFileDialog.getSaveFileName(self, "txt 저장", start, "텍스트 파일 (*.txt)")
         if not path:
@@ -748,6 +950,130 @@ class MainWindow(QMainWindow):
         except OSError as ex:
             self._set_state(f"저장하지 못했어요. ({ex})", warn=True)
 
+    # --- AI 기사 초안
+    def _src_text(self) -> str:
+        """AI 에 보낼 '추출한 글'. 다른 탭을 보고 있어도 추출한 글을 돌려준다."""
+        return self.edit.toPlainText() if self._tab == "src" else self._texts.get("src", "")
+
+    def _ai_key(self) -> str:
+        return str(self.settings.value("ai/key", "")).strip() or os.environ.get("ANTHROPIC_API_KEY", "").strip()
+
+    def _ai_prefs(self) -> tuple[str, bool, float]:
+        model = str(self.settings.value("ai/model", "")) or aidraft.DEFAULT_MODEL
+        full = str(self.settings.value("ai/full", "true")).lower() != "false"
+        try:
+            rate = float(self.settings.value("ai/rate", aidraft.DEFAULT_KRW_RATE))
+        except (TypeError, ValueError):
+            rate = aidraft.DEFAULT_KRW_RATE
+        return model, full, rate
+
+    def open_ai_settings(self) -> bool:
+        model, full, rate = self._ai_prefs()
+        dlg = aiui.AiSettingsDialog(self, self._ai_key(), model, full, rate)
+        if dlg.exec() != QDialog.Accepted:
+            return False
+        key, model, full, rate = dlg.values()
+        self.settings.setValue("ai/key", key)
+        self.settings.setValue("ai/model", model)
+        self.settings.setValue("ai/full", full)
+        self.settings.setValue("ai/rate", rate)
+        self._set_state("AI 설정을 저장했어요.")
+        return True
+
+    def start_ai(self) -> None:
+        src = self._src_text().strip()
+        if not src or self._busy:
+            return
+        if not self._ai_key():
+            if not self.open_ai_settings() or not self._ai_key():
+                return
+        model, full, rate = self._ai_prefs()
+        _g, n_files, n_chars = aidraft.load_guidelines(full)
+        eng = str(self.settings.value("ai/english", "true")).lower() != "false"
+        dlg = aiui.AiOptionsDialog(self, model, n_files, n_chars, eng, redraft=self._draft is not None)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        mode, english = dlg.values()
+        self.settings.setValue("ai/english", english)
+        self._job += 1
+        job = self._job
+        self._busy = True
+        self.view.set_busy(True)
+        self.btn_ai.setText("초안 쓰는 중…")
+        self._set_state("AI가 기사 초안을 쓰는 중이에요… (보통 20~60초)")
+        self._refresh_enabled()
+        name = os.path.basename(self.doc_path or self.img_path)
+        w = aiui.AiWorker(job, src, mode, english, self._ai_key(), model, full, rate, name, self)
+        w.ok.connect(self._on_ai_ok)
+        w.failed.connect(self._on_ai_fail)
+        w.finished.connect(lambda ww=w: self._workers.remove(ww) if ww in self._workers else None)
+        self._workers.append(w)
+        w.start()
+
+    def _on_ai_ok(self, job: int, res) -> None:
+        if job != self._job:
+            return
+        self._finish_busy()
+        if self._tab == "src":
+            self._texts["src"] = self.edit.toPlainText()
+            self._scope_src = self.lbl_scope.text()
+        self._draft = res
+        for k in aidraft.SECTION_ORDER:
+            self._texts[k] = res.sections.get(k, "")
+        for k, b in self.tab_btns.items():
+            b.setVisible(k == "src" or bool(self._texts.get(k)))
+        self.tab_wrap.show()
+        self.btn_ai.setText("다시 쓰기")
+        self._tab = ""  # 강제로 다시 그리도록
+        self._show_tab("ko" if self._texts.get("ko") else next((k for k in aidraft.SECTION_ORDER if self._texts.get(k)), "src"))
+        self._show_warn(" ".join(["AI 초안이에요. 숫자·인용·사실은 원문과 꼭 대조해 주세요."] + res.notes))
+        self._set_state(f"AI 초안 완료 · {res.seconds:.0f}초 · {aidraft.format_cost(res)} · {res.model}")
+
+    def _on_ai_fail(self, job: int, msg: str) -> None:
+        if job != self._job:
+            return
+        self._finish_busy()
+        self.btn_ai.setText("다시 쓰기" if self._draft else "기사 초안 → AI")
+        self._show_warn(msg)
+        self._set_state("AI 초안을 만들지 못했어요.", warn=True)
+
+    def _reset_ai(self) -> None:
+        """새 파일을 열면 이전 AI 초안과 탭을 지운다."""
+        self._draft = None
+        self._texts = {}
+        self._tab = "src"
+        for k, b in self.tab_btns.items():
+            b.setChecked(k == "src")
+        self.tab_wrap.hide()
+        self.chip_wrap.show()
+        self.btn_ai.setText("기사 초안 → AI")
+        self.btn_copy.setText("전체 복사")
+
+    def _show_tab(self, key: str) -> None:
+        if key == self._tab:
+            self.tab_btns[key].setChecked(True)
+            return
+        if self._tab:
+            self._texts[self._tab] = self.edit.toPlainText()
+        if self._tab == "src":
+            self._scope_src = self.lbl_scope.text()
+        self._tab = key
+        self._setting_text = True
+        self.edit.setPlainText(self._texts.get(key, ""))
+        self._setting_text = False
+        for k, b in self.tab_btns.items():
+            b.setChecked(k == key)
+        self.chip_wrap.setVisible(key == "src")
+        self.btn_copy.setText(self._copy_label())
+        if key == "src":
+            self.lbl_scope.setText(self._scope_src)
+        else:
+            self.lbl_scope.setText("AI 초안 · 확인 필요")
+        self._apply_highlight()
+        self._refresh_enabled()
+        text = self.edit.toPlainText()
+        self.lbl_count.setText(f"글자 수 {len(text.replace(chr(10), '')):,}자" if text else "")
+
     # --- 끌어다 놓기(창 어디에 놓아도) / 종료
     def dragEnterEvent(self, e) -> None:  # noqa: N802
         if e.mimeData().hasUrls():
@@ -758,7 +1084,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e) -> None:  # noqa: N802
         for w in list(self._workers):
-            w.wait(3000)
+            if not w.wait(3000):  # AI 호출이 길어져도 창을 닫을 수 있게
+                w.terminate()
+                w.wait(500)
         ask_on_exit(self, self.settings, self._used, on_shown=set_dark_titlebar)
         e.accept()
 
